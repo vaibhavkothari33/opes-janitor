@@ -38,6 +38,17 @@ already throwing `Volsnap` errors. First run returned **23 GB**.
 
 ## What it looks like
 
+<!-- DEMO GIF - uncomment the block below once demo/demo.gif is recorded.
+     Record it in a VM: every frame shows real paths, and on Windows a path
+     contains the profile name. See demo/RECORDING.md for the checklist.
+     Regenerate with:  vhs demo/demo.tape
+
+<div align="center">
+  <img src="demo/demo.gif" alt="opes-janitor reporting 30 GB of reclaimable cache, then cleaning it" width="100%">
+</div>
+
+-->
+
 ```
   opes-janitor 1.0.0  [DRY-RUN]  level=deep
 
