@@ -185,17 +185,17 @@ and logged; it is not an error and does not stop the run.
 
 Beyond the guard:
 
-- 🔒 **Dry run is the default.** `-Apply` is required before anything is deleted.
-- 🔗 **Junctions and symlinks are skipped, never traversed.** A reparse point
+- **Dry run is the default.** `-Apply` is required before anything is deleted.
+- **Junctions and symlinks are skipped, never traversed.** A reparse point
   planted inside a cache directory cannot redirect deletion into real data.
-- 📁 **Only children are deleted, never the target directory itself,** so tools
+- **Only children are deleted, never the target directory itself,** so tools
   that expect their cache root to exist keep working.
-- 🔓 **Locked files are counted and reported, not fatal.** A running dev server
+- **Locked files are counted and reported, not fatal.** A running dev server
   holding a temp file does not abort the run.
-- 📝 **Every deletion is logged** to `janitor.log` with byte counts.
-- 🐳 **`docker system prune` omits `--volumes`.** Named volumes — where database
+- **Every deletion is logged** to `janitor.log` with byte counts.
+- **`docker system prune` omits `--volumes`.** Named volumes — where database
   data lives — are preserved.
-- 🌐 **No network access, no telemetry.** Probes run local CLI tools; nothing
+- **No network access, no telemetry.** Probes run local CLI tools; nothing
   leaves the machine.
 
 Targets prefixed `REVIEW-` ship with `enabled: false`. They exist to surface
