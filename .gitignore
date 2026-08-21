@@ -6,11 +6,9 @@ janitor.log
 janitor.config.local.json
 config.local.json
 
-# VHS scratch output. demo/demo.gif IS committed - it is the README asset.
-demo/frames/
-demo/*.ascii
-demo/*.mp4
-demo/*.webm
+# Demo assets are kept local for now, not published.
+# To publish them again: drop this line, then `git add -f demo/`.
+demo/
 
 # Editor / OS noise
 .vscode/
