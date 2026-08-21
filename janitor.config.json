@@ -1,0 +1,202 @@
+{
+  "version": 1,
+  "_comment": "opes-janitor config. Edit 'enabled' to opt targets in or out. level safe = caches only; deep = also DISM, docker prune, go modcache. Targets with enabled=false are reported but never touched. Paths use %VAR% tokens expanded at runtime, and FORWARD SLASHES - the engine normalizes them to backslashes.",
+
+  "thresholds": {
+    "warnBelowFreePercent": 15,
+    "skipRunAboveFreePercent": 25
+  },
+
+  "drives": ["C:", "D:"],
+
+  "logRetentionDays": 90,
+
+  "allowedPrefixes": [
+    "%LOCALAPPDATA%",
+    "%APPDATA%",
+    "%USERPROFILE%/.cache",
+    "%USERPROFILE%/.cargo",
+    "%USERPROFILE%/.nuget",
+    "%USERPROFILE%/.gradle",
+    "%USERPROFILE%/go/pkg/mod",
+    "%TEMP%",
+    "C:/Windows/Temp"
+  ],
+
+  "protectedPaths": [
+    "%USERPROFILE%/Desktop",
+    "%USERPROFILE%/Documents",
+    "%USERPROFILE%/Pictures",
+    "%USERPROFILE%/Videos",
+    "%USERPROFILE%/Music",
+    "%USERPROFILE%/OneDrive",
+    "%USERPROFILE%/.ssh",
+    "%USERPROFILE%/.aws",
+    "%USERPROFILE%/.config",
+    "%APPDATA%/Microsoft/Crypto"
+  ],
+
+  "targets": [
+    {
+      "id": "yarn-cache",
+      "label": "Yarn package cache",
+      "level": "safe",
+      "enabled": true,
+      "kind": "command",
+      "requires": "yarn",
+      "command": "yarn cache clean",
+      "measure": "%LOCALAPPDATA%/Yarn"
+    },
+    {
+      "id": "npm-cache",
+      "label": "npm package cache",
+      "level": "safe",
+      "enabled": true,
+      "kind": "command",
+      "requires": "npm",
+      "command": "npm cache clean --force",
+      "measure": "%LOCALAPPDATA%/npm-cache"
+    },
+    {
+      "id": "pnpm-store",
+      "label": "pnpm content-addressable store",
+      "level": "safe",
+      "enabled": true,
+      "kind": "command",
+      "requires": "pnpm",
+      "command": "pnpm store prune",
+      "measure": "%LOCALAPPDATA%/pnpm-store"
+    },
+    {
+      "id": "pip-cache",
+      "label": "pip wheel cache",
+      "level": "safe",
+      "enabled": true,
+      "kind": "command",
+      "requires": "pip",
+      "command": "pip cache purge",
+      "measure": "%LOCALAPPDATA%/pip/Cache"
+    },
+    {
+      "id": "uv-cache",
+      "label": "uv package cache",
+      "level": "safe",
+      "enabled": true,
+      "kind": "command",
+      "requires": "uv",
+      "command": "uv cache clean",
+      "measure": "%LOCALAPPDATA%/uv"
+    },
+    {
+      "id": "puppeteer-cache",
+      "label": "Puppeteer downloaded Chromium builds",
+      "level": "safe",
+      "enabled": true,
+      "kind": "pathContents",
+      "path": "%USERPROFILE%/.cache/puppeteer",
+      "measure": "%USERPROFILE%/.cache/puppeteer"
+    },
+    {
+      "id": "user-temp",
+      "label": "User temp folder (files older than 7d)",
+      "level": "safe",
+      "enabled": true,
+      "kind": "pathContents",
+      "path": "%LOCALAPPDATA%/Temp",
+      "measure": "%LOCALAPPDATA%/Temp",
+      "olderThanDays": 7
+    },
+    {
+      "id": "windows-temp",
+      "label": "Windows temp folder (files older than 7d)",
+      "level": "safe",
+      "enabled": true,
+      "kind": "pathContents",
+      "path": "C:/Windows/Temp",
+      "measure": "C:/Windows/Temp",
+      "olderThanDays": 7
+    },
+    {
+      "id": "recycle-bin",
+      "label": "Recycle Bin",
+      "level": "safe",
+      "enabled": true,
+      "kind": "builtin",
+      "builtin": "recyclebin",
+      "measure": "C:/$Recycle.Bin"
+    },
+    {
+      "id": "go-modcache",
+      "label": "Go module cache",
+      "level": "deep",
+      "enabled": true,
+      "kind": "command",
+      "requires": "go",
+      "command": "go clean -modcache",
+      "measure": "%USERPROFILE%/go/pkg/mod",
+      "note": "deep only - forces a re-download on the next build"
+    },
+    {
+      "id": "cargo-registry-cache",
+      "label": "Cargo registry download cache",
+      "level": "deep",
+      "enabled": true,
+      "kind": "pathContents",
+      "path": "%USERPROFILE%/.cargo/registry/cache",
+      "measure": "%USERPROFILE%/.cargo/registry/cache"
+    },
+    {
+      "id": "docker-prune",
+      "label": "Docker unused images, containers, build cache",
+      "level": "deep",
+      "enabled": true,
+      "kind": "command",
+      "requires": "docker",
+      "command": "docker system prune -af",
+      "measure": "%LOCALAPPDATA%/Docker",
+      "note": "does NOT pass --volumes - named volumes are preserved"
+    },
+    {
+      "id": "dism-componentstore",
+      "label": "Windows component store (superseded updates)",
+      "level": "deep",
+      "enabled": true,
+      "kind": "builtin",
+      "builtin": "dism",
+      "requiresAdmin": true,
+      "measure": "",
+      "note": "irreversible - already-installed updates can no longer be uninstalled afterwards"
+    },
+    {
+      "id": "REVIEW-orphan-ollama-blobs",
+      "label": "Orphaned Ollama blobs in home dir",
+      "level": "safe",
+      "enabled": false,
+      "kind": "pathContents",
+      "path": "%USERPROFILE%/blobs",
+      "measure": "%USERPROFILE%/blobs",
+      "note": "REPORT ONLY. Ollama now stores its models under the D drive. This path sits outside allowedPrefixes by design, so the engine REFUSES to delete it even if you flip enabled to true. Verify the blobs are stale, then remove them by hand."
+    },
+    {
+      "id": "REVIEW-downloads",
+      "label": "Downloads folder (items older than 90d)",
+      "level": "safe",
+      "enabled": false,
+      "kind": "pathContents",
+      "path": "%USERPROFILE%/Downloads",
+      "measure": "%USERPROFILE%/Downloads",
+      "olderThanDays": 90,
+      "note": "REPORT ONLY. Outside allowedPrefixes by design - the engine refuses it even if enabled. Let Windows Storage Sense handle Downloads, or clear it by hand."
+    },
+    {
+      "id": "REVIEW-huggingface",
+      "label": "HuggingFace model cache",
+      "level": "safe",
+      "enabled": false,
+      "kind": "pathContents",
+      "path": "%USERPROFILE%/.cache/huggingface",
+      "measure": "%USERPROFILE%/.cache/huggingface",
+      "note": "REPORT ONLY. Inside allowedPrefixes, so flipping enabled to true WILL delete it. Re-downloading large models is slow - opt in deliberately."
+    }
+  ]
+}
