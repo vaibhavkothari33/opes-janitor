@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test on ${{ matrix.shell }}
+    runs-on: windows-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shell: powershell   # Windows PowerShell 5.1
+          - shell: pwsh         # PowerShell 7
+
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report PowerShell edition
+        run: |
+          $PSVersionTable | Format-List
+          exit 0
+
+      - name: Parse all scripts
+        run: |
+          $failed = $false
+          Get-ChildItem -Recurse -Filter *.ps1 | ForEach-Object {
+              $errors = $null
+              $null = [System.Management.Automation.Language.Parser]::ParseFile(
+                  $_.FullName, [ref]$null, [ref]$errors)
+              if ($errors.Count) {
+                  Write-Host "PARSE ERRORS in $($_.Name)" -ForegroundColor Red
+                  $errors | ForEach-Object { Write-Host "  $($_.Message)" }
+                  $failed = $true
+              } else {
+                  Write-Host "ok  $($_.Name)"
+              }
+          }
+          if ($failed) { exit 1 }
+
+      - name: Validate config JSON
+        run: |
+          $cfg = Get-Content janitor.config.json -Raw -Encoding UTF8 | ConvertFrom-Json
+          Write-Host "targets: $($cfg.targets.Count)"
+          Write-Host "probes:  $($cfg.probes.Count)"
+          if ($cfg.targets.Count -lt 1) { throw 'no targets in config' }
+          # every target id must be unique - duplicates silently shadow each other
+          $dupes = $cfg.targets.id | Group-Object | Where-Object Count -gt 1
+          if ($dupes) { throw "duplicate target ids: $($dupes.Name -join ', ')" }
+          # every probe must point at a real target
+          foreach ($p in $cfg.probes) {
+              if ($p.targetId -notin $cfg.targets.id) {
+                  throw "probe references unknown target: $($p.targetId)"
+              }
+          }
+
+      - name: Safety guard tests
+        run: ./test-guard.ps1
+
+      - name: List targets
+        run: ./janitor.ps1 -ListTargets
+
+      - name: Dry run must delete nothing
+        run: |
+          ./janitor.ps1 -Level deep -Force -NoToast
+          if (Test-Path janitor.log) {
+              if (Select-String -Path janitor.log -Pattern 'freed' -Quiet) {
+                  throw 'dry run wrote a "freed" entry to the log'
+              }
+          }
+
+      - name: WhatIf must delete nothing
+        run: |
+          ./janitor.ps1 -Apply -Level safe -Force -NoToast -WhatIf
+
+  lint:
+    name: PSScriptAnalyzer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
+
+      - name: Analyze
+        shell: pwsh
+        run: |
+          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error,Warning
+          if ($results) {
+              $results | Format-Table -AutoSize RuleName, Severity, ScriptName, Line, Message
+          } else {
+              Write-Host 'clean'
+          }
+          # Errors block the build; warnings are reported but tolerated.
+          $errors = @($results | Where-Object Severity -eq 'Error')
+          if ($errors.Count) { throw "$($errors.Count) analyzer error(s)" }

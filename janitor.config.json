@@ -1,15 +1,25 @@
 {
   "version": 1,
-  "_comment": "opes-janitor config. Edit 'enabled' to opt targets in or out. level safe = caches only; deep = also DISM, docker prune, go modcache. Targets with enabled=false are reported but never touched. Paths use %VAR% tokens expanded at runtime, and FORWARD SLASHES - the engine normalizes them to backslashes.",
+  "_comment": "opes-janitor config. Paths use %VAR% tokens and FORWARD SLASHES - the engine normalizes them, which keeps this file free of JSON escape sequences. Set drives to 'auto' to scan every fixed disk. Copy this file to %APPDATA%/opes-janitor/config.json to keep your edits across updates.",
 
   "thresholds": {
     "warnBelowFreePercent": 15,
     "skipRunAboveFreePercent": 25
   },
 
-  "drives": ["C:", "D:"],
+  "drives": "auto",
 
   "logRetentionDays": 90,
+
+  "_probes_comment": "Ask each tool where its cache really is, instead of assuming the default. A discovered path overrides the target's configured path and is allowlisted for that target only - it can never unlock a protectedPaths entry. Skip all of this with -NoProbe.",
+  "probes": [
+    { "targetId": "npm-cache",            "requires": "npm",   "command": "npm config get cache" },
+    { "targetId": "yarn-cache",           "requires": "yarn",  "command": "yarn cache dir" },
+    { "targetId": "pnpm-store",           "requires": "pnpm",  "command": "pnpm store path" },
+    { "targetId": "pip-cache",            "requires": "pip",   "command": "pip cache dir" },
+    { "targetId": "go-modcache",          "requires": "go",    "command": "go env GOMODCACHE" },
+    { "targetId": "cargo-registry-cache", "requires": "cargo", "envVar": "CARGO_HOME", "suffix": "registry/cache" }
+  ],
 
   "allowedPrefixes": [
     "%LOCALAPPDATA%",
@@ -20,7 +30,11 @@
     "%USERPROFILE%/.gradle",
     "%USERPROFILE%/go/pkg/mod",
     "%TEMP%",
-    "C:/Windows/Temp"
+    "C:/Windows/Temp",
+    "C:/Windows/Logs/CBS",
+    "C:/Windows/SoftwareDistribution/Download",
+    "C:/Windows/SoftwareDistribution/DeliveryOptimization",
+    "%PROGRAMDATA%/Microsoft/Windows/WER"
   ],
 
   "protectedPaths": [
@@ -29,11 +43,16 @@
     "%USERPROFILE%/Pictures",
     "%USERPROFILE%/Videos",
     "%USERPROFILE%/Music",
+    "%USERPROFILE%/Downloads",
     "%USERPROFILE%/OneDrive",
     "%USERPROFILE%/.ssh",
     "%USERPROFILE%/.aws",
+    "%USERPROFILE%/.kube",
     "%USERPROFILE%/.config",
-    "%APPDATA%/Microsoft/Crypto"
+    "%USERPROFILE%/source",
+    "%APPDATA%/Microsoft/Crypto",
+    "%APPDATA%/Bitwarden",
+    "%APPDATA%/KeePass"
   ],
 
   "targets": [
@@ -89,7 +108,7 @@
     },
     {
       "id": "puppeteer-cache",
-      "label": "Puppeteer downloaded Chromium builds",
+      "label": "Puppeteer downloaded browser builds",
       "level": "safe",
       "enabled": true,
       "kind": "pathContents",
@@ -104,7 +123,8 @@
       "kind": "pathContents",
       "path": "%LOCALAPPDATA%/Temp",
       "measure": "%LOCALAPPDATA%/Temp",
-      "olderThanDays": 7
+      "olderThanDays": 7,
+      "note": "this is what %TEMP% points at - the Win+R trick, but age-filtered and skipping open files"
     },
     {
       "id": "windows-temp",
@@ -115,6 +135,26 @@
       "path": "C:/Windows/Temp",
       "measure": "C:/Windows/Temp",
       "olderThanDays": 7
+    },
+    {
+      "id": "crash-dumps",
+      "label": "Application crash dumps",
+      "level": "safe",
+      "enabled": true,
+      "kind": "pathContents",
+      "path": "%LOCALAPPDATA%/CrashDumps",
+      "measure": "%LOCALAPPDATA%/CrashDumps",
+      "note": "dumps from apps that crashed. Only useful while actively debugging one."
+    },
+    {
+      "id": "wer-reports",
+      "label": "Windows Error Reporting archive",
+      "level": "safe",
+      "enabled": true,
+      "kind": "pathContents",
+      "path": "%PROGRAMDATA%/Microsoft/Windows/WER/ReportArchive",
+      "measure": "%PROGRAMDATA%/Microsoft/Windows/WER",
+      "requiresAdmin": true
     },
     {
       "id": "recycle-bin",
@@ -134,7 +174,7 @@
       "requires": "go",
       "command": "go clean -modcache",
       "measure": "%USERPROFILE%/go/pkg/mod",
-      "note": "deep only - forces a re-download on the next build"
+      "note": "deep only - forces a full re-download on the next build"
     },
     {
       "id": "cargo-registry-cache",
@@ -154,7 +194,40 @@
       "requires": "docker",
       "command": "docker system prune -af",
       "measure": "%LOCALAPPDATA%/Docker",
-      "note": "does NOT pass --volumes - named volumes are preserved"
+      "note": "does NOT pass --volumes - named volumes, where database data lives, are preserved"
+    },
+    {
+      "id": "windows-update-cache",
+      "label": "Downloaded Windows Update payloads",
+      "level": "deep",
+      "enabled": true,
+      "kind": "pathContents",
+      "path": "C:/Windows/SoftwareDistribution/Download",
+      "measure": "C:/Windows/SoftwareDistribution/Download",
+      "requiresAdmin": true,
+      "note": "already-installed updates keep their payload here. Windows re-downloads if it ever needs them again."
+    },
+    {
+      "id": "delivery-optimization",
+      "label": "Delivery Optimization peer cache",
+      "level": "deep",
+      "enabled": true,
+      "kind": "pathContents",
+      "path": "C:/Windows/SoftwareDistribution/DeliveryOptimization",
+      "measure": "C:/Windows/SoftwareDistribution/DeliveryOptimization",
+      "requiresAdmin": true,
+      "note": "update chunks cached to share with other PCs on the LAN. Regenerates."
+    },
+    {
+      "id": "cbs-logs",
+      "label": "Component Based Servicing logs (older than 30d)",
+      "level": "deep",
+      "enabled": true,
+      "kind": "pathContents",
+      "path": "C:/Windows/Logs/CBS",
+      "measure": "C:/Windows/Logs/CBS",
+      "requiresAdmin": true,
+      "olderThanDays": 30
     },
     {
       "id": "dism-componentstore",
@@ -165,17 +238,27 @@
       "builtin": "dism",
       "requiresAdmin": true,
       "measure": "",
-      "note": "irreversible - already-installed updates can no longer be uninstalled afterwards"
+      "note": "IRREVERSIBLE - after this, already-installed Windows updates can no longer be uninstalled"
     },
     {
-      "id": "REVIEW-orphan-ollama-blobs",
-      "label": "Orphaned Ollama blobs in home dir",
+      "id": "REVIEW-huggingface",
+      "label": "HuggingFace model cache",
       "level": "safe",
       "enabled": false,
       "kind": "pathContents",
-      "path": "%USERPROFILE%/blobs",
-      "measure": "%USERPROFILE%/blobs",
-      "note": "REPORT ONLY. Ollama now stores its models under the D drive. This path sits outside allowedPrefixes by design, so the engine REFUSES to delete it even if you flip enabled to true. Verify the blobs are stale, then remove them by hand."
+      "path": "%USERPROFILE%/.cache/huggingface",
+      "measure": "%USERPROFILE%/.cache/huggingface",
+      "note": "REPORT ONLY. Inside allowedPrefixes, so setting enabled to true WILL delete it. Re-downloading large models is slow - opt in deliberately."
+    },
+    {
+      "id": "REVIEW-thumbnail-cache",
+      "label": "Explorer thumbnail and icon cache",
+      "level": "safe",
+      "enabled": false,
+      "kind": "pathContents",
+      "path": "%LOCALAPPDATA%/Microsoft/Windows/Explorer",
+      "measure": "%LOCALAPPDATA%/Microsoft/Windows/Explorer",
+      "note": "REPORT ONLY. Explorer holds these open so most deletes fail unless you kill explorer.exe first, and folder browsing is slower until it rebuilds. Rarely worth it."
     },
     {
       "id": "REVIEW-downloads",
@@ -186,17 +269,7 @@
       "path": "%USERPROFILE%/Downloads",
       "measure": "%USERPROFILE%/Downloads",
       "olderThanDays": 90,
-      "note": "REPORT ONLY. Outside allowedPrefixes by design - the engine refuses it even if enabled. Let Windows Storage Sense handle Downloads, or clear it by hand."
-    },
-    {
-      "id": "REVIEW-huggingface",
-      "label": "HuggingFace model cache",
-      "level": "safe",
-      "enabled": false,
-      "kind": "pathContents",
-      "path": "%USERPROFILE%/.cache/huggingface",
-      "measure": "%USERPROFILE%/.cache/huggingface",
-      "note": "REPORT ONLY. Inside allowedPrefixes, so flipping enabled to true WILL delete it. Re-downloading large models is slow - opt in deliberately."
+      "note": "REPORT ONLY, and listed in protectedPaths - the engine refuses it even if you set enabled to true. Let Windows Storage Sense age out Downloads instead."
     }
   ]
 }

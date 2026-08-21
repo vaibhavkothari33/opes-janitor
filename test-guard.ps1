@@ -4,14 +4,16 @@
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$src = 'D:\opes-clean\tools\janitor\janitor.ps1'
-$cfgPath = 'D:\opes-clean\tools\janitor\janitor.config.json'
+# Resolve relative to this script so the suite runs from any checkout, including CI.
+$here    = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
+$src     = Join-Path $here 'janitor.ps1'
+$cfgPath = Join-Path $here 'janitor.config.json'
 
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($src, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw "parse errors in $src" }
 
-foreach ($fn in @('Test-SafeToDelete','Expand-PathToken')) {
+foreach ($fn in @('Get-CanonicalPath','Test-SafeToDelete','Expand-PathToken')) {
     $def = $ast.FindAll({ param($n)
         $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn
     }, $true) | Select-Object -First 1
@@ -37,12 +39,16 @@ $cases = @(
     @{ Path = "$u\Downloads";                     Expect = $false; Why = 'outside allowlist' }
     @{ Path = "$u\blobs";                         Expect = $false; Why = 'outside allowlist' }
     @{ Path = 'C:\Program Files';                 Expect = $false; Why = 'outside allowlist' }
-    @{ Path = 'D:\opes-clean';                    Expect = $false; Why = 'outside allowlist' }
+    @{ Path = $here;                              Expect = $false; Why = 'the checkout itself is outside the allowlist' }
     @{ Path = "$u\.ssh";                          Expect = $false; Why = 'protected' }
     @{ Path = 'C:\Windows\Temp';                  Expect = $true;  Why = 'allowlisted' }
     @{ Path = "$env:LOCALAPPDATA\Temp";           Expect = $true;  Why = 'allowlisted' }
     @{ Path = "$env:LOCALAPPDATA\Yarn";           Expect = $true;  Why = 'allowlisted' }
     @{ Path = "$u\.cache\puppeteer";              Expect = $true;  Why = 'allowlisted' }
+    # 8.3 short-form paths must canonicalize before matching. On profiles whose
+    # name contains a space, %TEMP% expands short ("VAIBHA~1") while
+    # %LOCALAPPDATA% expands long - a naive StartsWith would disagree.
+    @{ Path = $env:TEMP;                          Expect = $true;  Why = 'short form of an allowlisted dir' }
 )
 
 $pass = 0; $fail = 0; $skip = 0
@@ -64,6 +70,24 @@ foreach ($c in $cases) {
     $color = if ($ok) { 'Green' } else { 'Red' }
     Write-Host ('  {0}  {1,-6}  {2,-6}  {3}' -f $tag, $c.Expect, $got, $c.Path) -ForegroundColor $color
     if (-not $ok) { Write-Host ("          reason given: $reason") -ForegroundColor Red }
+}
+
+# --- canonicalization assertion ------------------------------------------
+# Short (8.3) and long forms of the same directory must canonicalize to one
+# string, or every prefix comparison in Test-SafeToDelete is unreliable.
+Write-Host ''
+$cShort = Get-CanonicalPath $env:TEMP
+$cLong  = Get-CanonicalPath "$env:LOCALAPPDATA\Temp"
+if ($cShort -eq $cLong) {
+    Write-Host '  PASS    short/long path forms canonicalize identically' -ForegroundColor Green
+    Write-Host ("            $env:TEMP") -ForegroundColor DarkGray
+    Write-Host ("         -> $cShort") -ForegroundColor DarkGray
+    $pass++
+} else {
+    Write-Host '  FAIL    short/long path forms disagree after canonicalization' -ForegroundColor Red
+    Write-Host ("            short -> $cShort") -ForegroundColor Red
+    Write-Host ("            long  -> $cLong")  -ForegroundColor Red
+    $fail++
 }
 
 Write-Host ''

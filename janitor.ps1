@@ -1,3 +1,4 @@
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     opes-janitor - reclaims disk space from developer tool caches on Windows.
@@ -8,25 +9,33 @@
 
     DRY RUN IS THE DEFAULT. Nothing is deleted unless you pass -Apply.
 
+    Cache locations are discovered by asking each tool where its cache actually
+    lives (npm config get cache, yarn cache dir, go env GOMODCACHE, ...) rather
+    than assuming defaults, so relocated caches are still found. Use -NoProbe to
+    skip discovery and use the configured defaults only.
+
     Every deletion is appended to janitor.log next to this script.
 
 .PARAMETER Apply
     Actually perform the cleanup. Without this, the script only reports.
 
 .PARAMETER Level
-    safe  - package manager caches, temp files, recycle bin (default)
+    safe  - package manager caches, temp files, crash dumps, recycle bin (default)
     deep  - everything in safe, plus DISM component store, docker prune,
-            go modcache. Slower, and forces re-downloads later.
+            go modcache, Windows update payloads. Forces re-downloads later.
 
 .PARAMETER Force
     Run even when free space is already above the configured threshold.
 
 .PARAMETER Only
-    Comma-separated target ids to run exclusively. e.g. -Only yarn-cache,npm-cache
-    Using -Only also overrides a target's enabled=false flag.
+    Target ids to run exclusively. Overrides both enabled:false and the level
+    filter, but never the safety guard.
 
 .PARAMETER Skip
-    Comma-separated target ids to exclude.
+    Target ids to exclude.
+
+.PARAMETER NoProbe
+    Skip cache-location discovery. Uses the paths in the config verbatim.
 
 .PARAMETER ListTargets
     Print the configured targets and exit.
@@ -36,6 +45,12 @@
 
 .PARAMETER NoToast
     Do not show the completion notification.
+
+.PARAMETER Config
+    Path to a config file. Default search order:
+      1. -Config argument
+      2. %APPDATA%\opes-janitor\config.json   (survives updates)
+      3. janitor.config.json next to this script
 
 .EXAMPLE
     .\janitor.ps1
@@ -47,14 +62,17 @@
 
 .EXAMPLE
     .\janitor.ps1 -Apply -Level deep
-    Full clean. Run from an elevated prompt so DISM can work.
+    Full clean. Run from an elevated prompt so the admin-gated targets work.
 
 .EXAMPLE
-    .\janitor.ps1 -Apply -Only yarn-cache,npm-cache
-    Clean just the two node package caches.
+    .\janitor.ps1 -Apply -Confirm
+    Clean, prompting before each target.
+
+.LINK
+    https://github.com/vaibhavkothari33/opes-janitor
 #>
 
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
     [switch] $Apply,
     [ValidateSet('safe','deep')]
@@ -62,6 +80,7 @@ param(
     [switch] $Force,
     [string[]] $Only,
     [string[]] $Skip,
+    [switch] $NoProbe,
     [switch] $ListTargets,
     [switch] $Quiet,
     [switch] $NoToast,
@@ -71,19 +90,50 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
+$JanitorVersion = '1.0.0'
+
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
-if (-not $Config) { $Config = Join-Path $ScriptDir 'janitor.config.json' }
-$LogFile = Join-Path $ScriptDir 'janitor.log'
+$LogFile   = Join-Path $ScriptDir 'janitor.log'
+
+# Preload CimCmdlets explicitly. Under -WhatIf, autoloading it mid-run makes
+# PowerShell narrate every alias it registers ("What if: Set Alias gcim ..."),
+# which buries the report. Import-Module has no -WhatIf parameter of its own,
+# so drop the preference across the import and restore it.
+$savedWhatIfPreference = $WhatIfPreference
+$WhatIfPreference = $false
+Import-Module CimCmdlets -ErrorAction SilentlyContinue
+$WhatIfPreference = $savedWhatIfPreference
 
 # ---------------------------------------------------------------- helpers ---
 
+function Get-CanonicalPath {
+    # Normalizes a path to ONE canonical form so string prefix matching is sound.
+    #
+    # Why this exists: %TEMP% expands to the 8.3 short form ("C:\Users\ALICE~1\...")
+    # whenever the profile name contains a space, while %LOCALAPPDATA% expands to
+    # the long form. Resolve-Path preserves whichever form it was given, so a naive
+    # StartsWith() between the two silently fails - which would let a short-form
+    # path slip past a long-form protectedPaths entry.
+    param([string] $Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    $p = ($Path -replace '/', '\').Trim().TrimEnd('\')
+    # Get-Item resolves 8.3 -> long; [IO.Path]::GetFullPath cannot (it needs the
+    # filesystem), so it is only the fallback for paths that do not exist yet.
+    try {
+        if (Test-Path -LiteralPath $p) {
+            return (Get-Item -LiteralPath $p -Force).FullName.TrimEnd('\')
+        }
+    } catch { }
+    try   { return [System.IO.Path]::GetFullPath($p).TrimEnd('\') }
+    catch { return $p }
+}
+
 function Expand-PathToken {
-    # Expands %VAR% tokens and normalizes forward slashes to backslashes.
+    # Expands %VAR% tokens, normalizes forward slashes, then canonicalizes.
     # The config uses forward slashes so it needs no JSON escaping.
     param([string] $Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
-    $expanded = [Environment]::ExpandEnvironmentVariables($Path)
-    return ($expanded -replace '/', '\').TrimEnd('\')
+    return Get-CanonicalPath ([Environment]::ExpandEnvironmentVariables($Path))
 }
 
 function Format-Size {
@@ -97,7 +147,9 @@ function Format-Size {
 function Write-Log {
     param([string] $Message, [string] $Severity = 'INFO')
     $line = '{0} [{1,-5}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Severity, $Message
-    try { Add-Content -Path $LogFile -Value $line -Encoding utf8 } catch { }
+    # -WhatIf:$false - the log is a record of the run, including a -WhatIf run.
+    # Without this the log write itself gets narrated and suppressed.
+    try { Add-Content -Path $LogFile -Value $line -Encoding utf8 -WhatIf:$false } catch { }
 }
 
 function Say {
@@ -138,18 +190,95 @@ function Get-DriveInfo {
     }
 }
 
+function Get-FixedDrives {
+    # DriveType 3 = local fixed disk. Excludes removable, network, optical.
+    return @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue |
+             Where-Object { $_.Size -gt 0 } |
+             ForEach-Object { $_.DeviceID })
+}
+
+function Invoke-ExternalCommand {
+    param([string] $CommandLine)
+    try {
+        $output = & cmd.exe /c "$CommandLine 2>&1"
+        return @{ ExitCode = $LASTEXITCODE; Output = ($output -join [Environment]::NewLine) }
+    } catch {
+        return @{ ExitCode = -1; Output = $_.Exception.Message }
+    }
+}
+
+# ------------------------------------------------------- cache discovery ---
+
+function Resolve-ProbePath {
+    <#
+        Asks a tool where its cache actually lives, instead of assuming the
+        default location. Users relocate caches constantly (npmrc, CARGO_HOME,
+        GOMODCACHE, YARN_CACHE_FOLDER), and a hardcoded default silently misses
+        those - the janitor would report "already empty" while gigabytes sit
+        somewhere else.
+
+        Returns a canonical path, or $null if the tool is absent / said nothing
+        useful. Never throws.
+    #>
+    param($Probe)
+
+    try {
+        if ($Probe.PSObject.Properties.Name -contains 'requires' -and $Probe.requires) {
+            if (-not (Get-Command $Probe.requires -ErrorAction SilentlyContinue)) { return $null }
+        }
+
+        $raw = $null
+
+        if ($Probe.PSObject.Properties.Name -contains 'envVar' -and $Probe.envVar) {
+            $raw = [Environment]::GetEnvironmentVariable($Probe.envVar)
+        }
+
+        if (-not $raw -and $Probe.PSObject.Properties.Name -contains 'command' -and $Probe.command) {
+            $r = Invoke-ExternalCommand $Probe.command
+            if ($r.ExitCode -ne 0) { return $null }
+            # tools sometimes emit warnings first - take the last non-empty line
+            $raw = ($r.Output -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 1)
+        }
+
+        if (-not $raw) { return $null }
+        $raw = $raw.Trim().Trim('"')
+        if (-not $raw) { return $null }
+
+        if ($Probe.PSObject.Properties.Name -contains 'suffix' -and $Probe.suffix) {
+            $raw = Join-Path $raw ($Probe.suffix -replace '/', '\')
+        }
+
+        $canon = Get-CanonicalPath $raw
+        # a probe that returns something absurd (a bare drive, a relative
+        # fragment) is treated as a failed probe, not as a target
+        if (-not $canon) { return $null }
+        $segments = @($canon -split '\\' | Where-Object { $_ -ne '' })
+        if ($segments.Count -lt 3) { return $null }
+        return $canon
+    } catch {
+        return $null
+    }
+}
+
 # ----------------------------------------------------------------- safety ---
 
 function Test-SafeToDelete {
-    # Gatekeeper for every destructive path operation. A path must clear ALL of:
-    #   1. non-empty, exists, is a directory
-    #   2. at least 2 segments below the drive root
-    #   3. not inside (or equal to) any configured protectedPath
-    #   4. inside at least one configured allowedPrefix
+    <#
+        Gatekeeper for every destructive path operation. A path must clear ALL of:
+          1. non-empty, exists, is a directory
+          2. at least two segments below the drive root
+          3. not inside (or equal to) any configured protectedPath
+          4. inside at least one allowedPrefix, or equal to / inside this
+             target's own probe-discovered path
+
+        Check 3 is evaluated BEFORE check 4, so a protected path can never be
+        unlocked by an allowlist entry or by cache discovery.
+    #>
     param(
         [string] $Path,
         [string[]] $AllowedPrefixes,
         [string[]] $ProtectedPaths,
+        [string] $ExtraAllowed,
         [ref] $Reason
     )
 
@@ -160,7 +289,8 @@ function Test-SafeToDelete {
         $Reason.Value = 'does not exist'; return $false
     }
 
-    $full = (Resolve-Path -LiteralPath $Path).ProviderPath.TrimEnd('\')
+    # canonical form only - see Get-CanonicalPath for why Resolve-Path is unsafe
+    $full = Get-CanonicalPath $Path
 
     if (-not (Get-Item -LiteralPath $full -Force).PSIsContainer) {
         $Reason.Value = 'not a directory'; return $false
@@ -172,6 +302,7 @@ function Test-SafeToDelete {
         $Reason.Value = "too shallow: $full"; return $false
     }
 
+    # protected wins over everything, including discovery
     foreach ($p in $ProtectedPaths) {
         if (-not $p) { continue }
         $pf = $p.TrimEnd('\')
@@ -180,7 +311,10 @@ function Test-SafeToDelete {
         }
     }
 
-    foreach ($a in $AllowedPrefixes) {
+    $candidates = @($AllowedPrefixes)
+    if ($ExtraAllowed) { $candidates += $ExtraAllowed }
+
+    foreach ($a in $candidates) {
         if (-not $a) { continue }
         $af = $a.TrimEnd('\')
         if ($full -eq $af -or $full.StartsWith($af + '\', [StringComparison]::OrdinalIgnoreCase)) {
@@ -235,16 +369,6 @@ function Clear-DirectoryContents {
     return $stats
 }
 
-function Invoke-ExternalCommand {
-    param([string] $CommandLine)
-    try {
-        $output = & cmd.exe /c "$CommandLine 2>&1"
-        return @{ ExitCode = $LASTEXITCODE; Output = ($output -join [Environment]::NewLine) }
-    } catch {
-        return @{ ExitCode = -1; Output = $_.Exception.Message }
-    }
-}
-
 function Show-Toast {
     param([string] $Title, [string] $Message)
     if ($NoToast) { return }
@@ -264,19 +388,59 @@ function Show-Toast {
     }
 }
 
+# --------------------------------------------------------- config loading ---
+
+function Resolve-ConfigPath {
+    param([string] $Explicit, [string] $ScriptDirectory)
+    if ($Explicit) {
+        if (-not (Test-Path -LiteralPath $Explicit)) { throw "Config not found: $Explicit" }
+        return (Get-Item -LiteralPath $Explicit).FullName
+    }
+    # a user copy in APPDATA survives updates that overwrite the shipped config
+    $userCfg = Join-Path $env:APPDATA 'opes-janitor\config.json'
+    if (Test-Path -LiteralPath $userCfg) { return $userCfg }
+
+    $shipped = Join-Path $ScriptDirectory 'janitor.config.json'
+    if (Test-Path -LiteralPath $shipped) { return $shipped }
+
+    throw "No config found. Looked for: $userCfg and $shipped"
+}
+
 # ------------------------------------------------------------------- main ---
 
-if (-not (Test-Path -LiteralPath $Config)) {
-    Write-Error "Config not found: $Config"
+try {
+    $configPath = Resolve-ConfigPath -Explicit $Config -ScriptDirectory $ScriptDir
+} catch {
+    Write-Error $_.Exception.Message
     exit 2
 }
 
-$cfg = Get-Content -LiteralPath $Config -Raw -Encoding UTF8 | ConvertFrom-Json
+try {
+    $cfg = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+} catch {
+    Write-Error "Config is not valid JSON: $configPath`n$($_.Exception.Message)"
+    exit 2
+}
 
-$allowed   = @($cfg.allowedPrefixes | ForEach-Object { Expand-PathToken $_ })
-$protected = @($cfg.protectedPaths  | ForEach-Object { Expand-PathToken $_ })
+$allowed   = @($cfg.allowedPrefixes | ForEach-Object { Expand-PathToken $_ } | Where-Object { $_ })
+$protected = @($cfg.protectedPaths  | ForEach-Object { Expand-PathToken $_ } | Where-Object { $_ })
+
+# --- cache discovery ----------------------------------------------------
+
+$probed = @{}
+if (-not $NoProbe -and ($cfg.PSObject.Properties.Name -contains 'probes')) {
+    foreach ($probe in $cfg.probes) {
+        $found = Resolve-ProbePath $probe
+        if ($found) { $probed[$probe.targetId] = $found }
+    }
+}
+
+# --- list mode ----------------------------------------------------------
 
 if ($ListTargets) {
+    Write-Host ''
+    Write-Host "  opes-janitor $JanitorVersion" -ForegroundColor Cyan
+    Write-Host "  config: $configPath" -ForegroundColor DarkGray
     Write-Host ''
     Write-Host '  ID                             LEVEL  ON   KIND          LABEL' -ForegroundColor Cyan
     Write-Host '  -----------------------------  -----  ---  ------------  ------------------------------'
@@ -284,6 +448,9 @@ if ($ListTargets) {
         $on    = if ($t.enabled) { 'yes' } else { 'no ' }
         $color = if ($t.enabled) { 'Gray' } else { 'DarkGray' }
         Write-Host ('  {0,-29}  {1,-5}  {2}  {3,-12}  {4}' -f $t.id, $t.level, $on, $t.kind, $t.label) -ForegroundColor $color
+        if ($probed.ContainsKey($t.id)) {
+            Write-Host ("      discovered: $($probed[$t.id])") -ForegroundColor DarkCyan
+        }
     }
     Write-Host ''
     exit 0
@@ -293,19 +460,34 @@ $runMode = if ($Apply) { 'APPLY' } else { 'DRY-RUN' }
 $isAdmin = Test-IsAdmin
 
 Say ''
-Say "  opes-janitor  [$runMode]  level=$Level" 'Cyan'
+Say "  opes-janitor $JanitorVersion  [$runMode]  level=$Level" 'Cyan'
 Say '  ---------------------------------------------------------------' 'DarkGray'
-Write-Log "run start: mode=$runMode level=$Level user=$env:USERNAME admin=$isAdmin"
+Write-Log "run start: v$JanitorVersion mode=$runMode level=$Level admin=$isAdmin config=$configPath"
+
+if ($probed.Count -gt 0 -and -not $Quiet) {
+    foreach ($k in $probed.Keys) {
+        Say ("  discovered  {0,-22} {1}" -f $k, $probed[$k]) 'DarkCyan'
+        Write-Log "discovered $k -> $($probed[$k])"
+    }
+    Say ''
+}
 
 # --- drive report -------------------------------------------------------
 
+$driveList = @()
+if ($cfg.drives -is [string] -and $cfg.drives -eq 'auto') {
+    $driveList = Get-FixedDrives
+} else {
+    $driveList = @($cfg.drives)
+}
+
 $driveState = @()
-foreach ($d in $cfg.drives) {
+foreach ($d in $driveList) {
     $info = Get-DriveInfo $d
     if (-not $info) { continue }
     $driveState += $info
     $color = 'Green'
-    if ($info.FreePct -lt $cfg.thresholds.warnBelowFreePercent)      { $color = 'Red' }
+    if ($info.FreePct -lt $cfg.thresholds.warnBelowFreePercent)        { $color = 'Red' }
     elseif ($info.FreePct -lt $cfg.thresholds.skipRunAboveFreePercent) { $color = 'Yellow' }
     Say ('  {0}  {1,6:N1} GB free of {2,6:N1} GB   {3,5:N1}% free' -f $info.Drive, $info.FreeGB, $info.TotalGB, $info.FreePct) $color
     Write-Log ('drive {0}: {1}GB free / {2}GB ({3}%)' -f $info.Drive, $info.FreeGB, $info.TotalGB, $info.FreePct)
@@ -330,7 +512,8 @@ foreach ($t in $cfg.targets) {
     if ($Only -and ($t.id -notin $Only)) { continue }
     if ($Skip -and ($t.id -in $Skip))    { continue }
     if ($Only) {
-        # explicit -Only overrides both the enabled flag and the level filter
+        # explicit -Only overrides the enabled flag and the level filter,
+        # but never the safety guard
         $selected += ,@($t, 'run')
         continue
     }
@@ -347,13 +530,17 @@ $totalFreed = [int64] 0
 foreach ($pair in $selected) {
     $t        = $pair[0]
     $itemMode = $pair[1]
+    $hasProp  = $t.PSObject.Properties.Name
 
-    $measurePath = Expand-PathToken $t.measure
+    # a discovered path overrides the configured default for this target
+    $discovered  = $null
+    if ($probed.ContainsKey($t.id)) { $discovered = $probed[$t.id] }
+
+    $measurePath = if ($discovered) { $discovered } else { Expand-PathToken $t.measure }
     $before      = Get-DirSize $measurePath
     $status      = ''
     $freed       = [int64] 0
 
-    $hasProp    = $t.PSObject.Properties.Name
     $missingReq = $false
     if (($hasProp -contains 'requires') -and $t.requires) {
         if (-not (Get-Command $t.requires -ErrorAction SilentlyContinue)) { $missingReq = $true }
@@ -376,14 +563,17 @@ foreach ($pair in $selected) {
         $status = 'would clean'
         $freed  = $before
     }
+    elseif (-not $PSCmdlet.ShouldProcess($t.label, 'Clear')) {
+        $status = 'skipped (WhatIf/declined)'
+    }
     else {
         # ------------------- destructive from here -------------------
         switch ($t.kind) {
 
             'pathContents' {
-                $p = Expand-PathToken $t.path
+                $p = if ($discovered) { $discovered } else { Expand-PathToken $t.path }
                 $reason = ''
-                if (-not (Test-SafeToDelete -Path $p -AllowedPrefixes $allowed -ProtectedPaths $protected -Reason ([ref]$reason))) {
+                if (-not (Test-SafeToDelete -Path $p -AllowedPrefixes $allowed -ProtectedPaths $protected -ExtraAllowed $discovered -Reason ([ref]$reason))) {
                     $status = "REFUSED: $reason"
                     Write-Log "REFUSED $($t.id): $reason" 'WARN'
                     break
@@ -476,10 +666,10 @@ Say ('  ' + $summary) 'Green'
 if (-not $Apply -and $totalFreed -gt 0) {
     Say ''
     Say '  NOTE: dry-run figures are an UPPER BOUND, not a promise.' 'DarkYellow'
-    Say '    - age-filtered targets (user-temp, windows-temp) show the whole folder,' 'DarkGray'
-    Say '      but only files past their age cutoff are actually removed' 'DarkGray'
+    Say '    - age-filtered targets show the whole folder, but only files past' 'DarkGray'
+    Say '      their age cutoff are actually removed' 'DarkGray'
     Say '    - docker-prune only removes UNUSED layers, and the WSL vhdx does not' 'DarkGray'
-    Say '      shrink on its own, so reclaimed space may not show up on C: at once' 'DarkGray'
+    Say '      shrink on its own, so reclaimed space may not show up at once' 'DarkGray'
     Say '    - locked / in-use files are skipped' 'DarkGray'
     Say ''
     Say '  Re-run with -Apply to actually clean.' 'Yellow'
@@ -487,7 +677,7 @@ if (-not $Apply -and $totalFreed -gt 0) {
 
 if ($Apply) {
     Say ''
-    foreach ($d in $cfg.drives) {
+    foreach ($d in $driveList) {
         $info = Get-DriveInfo $d
         if (-not $info) { continue }
         $color = if ($info.FreePct -lt $cfg.thresholds.warnBelowFreePercent) { 'Red' } else { 'Green' }
@@ -506,7 +696,7 @@ try {
         $kept = Get-Content -LiteralPath $LogFile | Where-Object {
             if ($_ -match '^(\d{4}-\d{2}-\d{2})') { [datetime]::Parse($Matches[1]) -ge $cut } else { $true }
         }
-        Set-Content -LiteralPath $LogFile -Value $kept -Encoding utf8
+        Set-Content -LiteralPath $LogFile -Value $kept -Encoding utf8 -WhatIf:$false
     }
 } catch { }
 

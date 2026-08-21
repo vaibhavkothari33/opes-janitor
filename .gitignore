@@ -1,0 +1,15 @@
+# Run logs contain local paths and the machine's username - never publish them.
+janitor.log
+*.log
+
+# A local config copy, if you keep one beside the script instead of in %APPDATA%.
+janitor.config.local.json
+config.local.json
+
+# Editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.swp
+*~
